@@ -110,11 +110,26 @@ function M.select_executable(dir)
     if #executables == 1 then
         return executables[1]
     end
-    
+
+    local co = coroutine.running()
+    if co then
+        -- vim.ui.select (snacks lo overridea con picker flotante)
+        vim.ui.select(executables, {
+            prompt = "Seleccionar ejecutable:",
+            format_item = function(path)
+                return vim.fn.fnamemodify(path, ":t")
+            end,
+        }, function(choice)
+            coroutine.resume(co, choice)
+        end)
+        return coroutine.yield()
+    end
+
+    -- Fallback: vim.fn.inputlist (sin coroutine)
     local items = { "Seleccione un ejecutable:" }
     for i, path in ipairs(executables) do
         local name = vim.fn.fnamemodify(path, ":t")
-        table.insert(items, i .. ". " .. name) -- Resultado: "1. mi_programa"
+        table.insert(items, i .. ". " .. name)
     end
 
     local choice = vim.fn.inputlist(items)
@@ -490,8 +505,24 @@ function M.program_with_build(default_binary)
     end
 
     -- Pide confirmación/modificación de la ruta al usuario
-    local bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
-    if bin_path == "" then
+    local bin_path
+    local co_input = coroutine.running()
+    if co_input then
+        -- vim.ui.input (snacks lo overridea con input flotante)
+        vim.ui.input({
+            prompt = "Ejecutable: ",
+            default = default_path,
+        }, function(input)
+            bin_path = input
+            coroutine.resume(co_input)
+        end)
+        coroutine.yield()
+    else
+        -- fallback: vim.fn.input sincrónico
+        bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
+    end
+
+    if not bin_path or bin_path == "" then
         vim.notify("Sesión DAP cancelada.", vim.log.levels.WARN)
         return nil
     end
@@ -563,8 +594,22 @@ function M.program_with_build_sync(default_binary)
       and (cwd .. "/" .. default_binary)
       or (cwd .. "/" .. M.config.build_dir .. "/")
 
-    local bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
-    if bin_path == "" then return nil end
+    local bin_path
+    local co_sync = coroutine.running()
+    if co_sync then
+        vim.ui.input({
+            prompt = "Ejecutable: ",
+            default = default_path,
+        }, function(input)
+            bin_path = input
+            coroutine.resume(co_sync)
+        end)
+        coroutine.yield()
+    else
+        bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
+    end
+
+    if not bin_path or bin_path == "" then return nil end
 
     local done = false
     local final_path = nil
