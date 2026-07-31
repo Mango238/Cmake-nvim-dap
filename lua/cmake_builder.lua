@@ -40,6 +40,15 @@ M.config = {
   -- Si es true, siempre compila sin verificar mtime (útil para proyectos con generated files)
   always_build = false,
 
+  -- Si es true, verifica que build/ tenga CMAKE_BUILD_TYPE=Debug (o RelWithDebInfo)
+  -- antes de compilar. Si no lo tiene (p. ej. build/ creado con `cmake -S . -B build`
+  -- sin -D), reconfigura automáticamente para que el binario tenga símbolos (-g) y
+  -- los breakpoints de dap funcionen.
+  ensure_debug_build = true,
+
+  -- Build type que se fuerza al reconfigurar cuando ensure_debug_build está activo.
+  debug_build_type = "Debug",
+
   -- Dónde mostrar el output del build: "quickfix" | "float"
   output_mode = "quickfix",
 
@@ -280,6 +289,48 @@ local function send_to_quickfix(lines, replace)
   })
 end
 
+--- Lee CMAKE_BUILD_TYPE del CMakeCache.txt de un build/ existente.
+--- Devuelve "" si el cache no existe o la variable está vacía.
+---@param build_dir string ruta absoluta al directorio de build
+---@return string
+local function get_cache_build_type(build_dir)
+  local f = io.open(build_dir .. "/CMakeCache.txt", "r")
+  if not f then return "" end
+  local build_type = ""
+  for line in f:lines() do
+    local value = line:match("^CMAKE_BUILD_TYPE:%a+=(.*)$")
+    if value then
+      build_type = value
+      break
+    end
+  end
+  f:close()
+  return build_type
+end
+
+--- Reconfigura cmake forzando CMAKE_BUILD_TYPE=<debug_build_type>.
+--- Necesario cuando build/ ya existe pero se generó sin build type (sin -g):
+--- el binario queda sin símbolos y los breakpoints de dap no bindean.
+---@param build_dir string
+---@param on_done fun(success: boolean)
+local function reconfigure_debug(build_dir, on_done)
+  local cwd = vim.fn.getcwd()
+  vim.schedule(function()
+    vim.notify(
+      "⚙ build/ sin CMAKE_BUILD_TYPE debug, reconfigurando con " .. M.config.debug_build_type .. "...",
+      vim.log.levels.WARN,
+      { title = "DAP / CMake" }
+    )
+  end)
+  vim.system(
+    { "cmake", "-S", cwd, "-B", build_dir, "-DCMAKE_BUILD_TYPE=" .. M.config.debug_build_type },
+    { cwd = cwd },
+    function(result)
+      vim.schedule(function() on_done(result.code == 0) end)
+    end
+  )
+end
+
 -- ─── Función principal de build ───────────────────────────────────────────────
 
 --- Ejecuta `cmake --build <build_dir>` de forma asíncrona.
@@ -457,6 +508,30 @@ function M.ensure_built(bin_path, on_ready, on_error)
     -- en program_with_build, sin importar si la ruta es síncrona o asíncrona.
     vim.schedule(on_error)
     return
+  end
+
+  -- Si build/ no tiene un build type debuggeable, reconfigurar ANTES de mirar
+  -- mtime: el binario puede estar "actualizado" respecto a las fuentes y aun
+  -- así no tener símbolos, porque nunca se compiló con -g.
+  if M.config.ensure_debug_build then
+    local build_type = get_cache_build_type(build_dir)
+    local is_debug = build_type == "Debug" or build_type == "RelWithDebInfo"
+    if not is_debug then
+      reconfigure_debug(build_dir, function(reconfigured)
+        if not reconfigured then
+          vim.schedule(function()
+            vim.notify("❌ Reconfigure de CMake falló, no se puede debuggear.", vim.log.levels.ERROR, { title = "DAP / CMake" })
+          end)
+          vim.schedule(on_error)
+          return
+        end
+        -- El build type cambió: fuerza recompilar aunque el mtime diga que está al día.
+        run_cmake_build(build_dir, function(success)
+          if success then on_ready(bin_path) else on_error() end
+        end)
+      end)
+      return
+    end
   end
 
   if not M.needs_rebuild(bin_path) then
