@@ -65,6 +65,36 @@ end
 
 -- ─── Utilidades internas ──────────────────────────────────────────────────────
 
+--- Invoca una API estilo vim.ui.* desde dentro de una coroutine y devuelve su resultado.
+--- Tolera implementaciones síncronas y asíncronas:
+---   - vim.ui.input/select de stock llaman al callback ANTES de retornar. Hacer
+---     coroutine.resume ahí actúa sobre la coroutine en ejecución (devuelve false,
+---     "cannot resume non-suspended coroutine") y el yield siguiente cuelga para siempre.
+---   - snacks.nvim / dressing.nvim las sustituyen por versiones asíncronas, donde el
+---     resume sí es necesario.
+--- El flag `state` distingue ambos casos: si la respuesta llegó antes del yield, no
+--- suspendemos y devolvemos el valor directamente.
+---@generic T
+---@param fn fun(cb: fun(result: T))
+---@return T|nil
+local function await_ui(fn)
+  local co = assert(coroutine.running(), "await_ui requiere una coroutine")
+  local state, value = "pending", nil
+
+  fn(function(result)
+    value = result
+    if state == "yielded" then
+      coroutine.resume(co, result)
+    else
+      state = "answered"
+    end
+  end)
+
+  if state == "answered" then return value end
+  state = "yielded"
+  return coroutine.yield()
+end
+
 --- Lista todos los ejecutables de un directorio y permite seleccionar uno.
 --- Retorna el path absoluto del ejecutable o nil si el usuario cancela.
 ---
@@ -120,18 +150,16 @@ function M.select_executable(dir)
         return executables[1]
     end
 
-    local co = coroutine.running()
-    if co then
+    if coroutine.running() then
         -- vim.ui.select (snacks lo overridea con picker flotante)
-        vim.ui.select(executables, {
-            prompt = "Seleccionar ejecutable:",
-            format_item = function(path)
-                return vim.fn.fnamemodify(path, ":t")
-            end,
-        }, function(choice)
-            coroutine.resume(co, choice)
+        return await_ui(function(cb)
+            vim.ui.select(executables, {
+                prompt = "Seleccionar ejecutable:",
+                format_item = function(path)
+                    return vim.fn.fnamemodify(path, ":t")
+                end,
+            }, cb)
         end)
-        return coroutine.yield()
     end
 
     -- Fallback: vim.fn.inputlist (sin coroutine)
@@ -581,17 +609,11 @@ function M.program_with_build(default_binary)
 
     -- Pide confirmación/modificación de la ruta al usuario
     local bin_path
-    local co_input = coroutine.running()
-    if co_input then
+    if coroutine.running() then
         -- vim.ui.input (snacks lo overridea con input flotante)
-        vim.ui.input({
-            prompt = "Ejecutable: ",
-            default = default_path,
-        }, function(input)
-            bin_path = input
-            coroutine.resume(co_input)
+        bin_path = await_ui(function(cb)
+            vim.ui.input({ prompt = "Ejecutable: ", default = default_path }, cb)
         end)
-        coroutine.yield()
     else
         -- fallback: vim.fn.input sincrónico
         bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
@@ -621,20 +643,13 @@ function M.program_with_build(default_binary)
     -- M.program_with_build_sync() que bloquea brevemente con vim.wait().
 
     -- Estrategia con coroutine (nvim-dap >= commit fd6aa38, ~2023):
-    local co = coroutine.running()
-    if co then
-      -- Estamos dentro de un coroutine de dap: podemos hacer yield/resume
-      local result_path = nil
-      local build_ok = false
-
-      M.ensure_built(bin_path, function(path)
-          coroutine.resume(co, path)  -- path YA es el binario, no hace falta select_executable
-      end, function()
-          coroutine.resume(co, nil)
+    if coroutine.running() then
+      -- Estamos dentro de un coroutine de dap: await_ui suspende hasta que
+      -- ensure_built llame a uno de sus dos callbacks. `path` YA es el binario,
+      -- no hace falta select_executable. on_error mapea a nil → dap no lanza.
+      return await_ui(function(cb)
+        M.ensure_built(bin_path, cb, function() cb(nil) end)
       end)
-
-      -- Suspende este coroutine hasta que ensure_built termine
-      return coroutine.yield()
     else
       -- Fallback: no hay coroutine (llamada directa). Usa vim.wait() para
       -- esperar el resultado asíncrono sin bloquear el event loop completamente.
@@ -670,16 +685,10 @@ function M.program_with_build_sync(default_binary)
       or (cwd .. "/" .. M.config.build_dir .. "/")
 
     local bin_path
-    local co_sync = coroutine.running()
-    if co_sync then
-        vim.ui.input({
-            prompt = "Ejecutable: ",
-            default = default_path,
-        }, function(input)
-            bin_path = input
-            coroutine.resume(co_sync)
+    if coroutine.running() then
+        bin_path = await_ui(function(cb)
+            vim.ui.input({ prompt = "Ejecutable: ", default = default_path }, cb)
         end)
-        coroutine.yield()
     else
         bin_path = vim.fn.input("Ejecutable: ", default_path, "file")
     end
